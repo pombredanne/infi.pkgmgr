@@ -35,35 +35,11 @@ class PackageManager(object): # pylint: disable=R0922
     def remove_package(self, package_name):
         raise NotImplementedError() # pragma: no cover
 
-
-class UbuntuPackageManager(PackageManager):
-    def install_package(self, package_name):
-        cmd = "apt-get install -y {}".format(package_name).split()
-        execute_command(cmd, timeout=INSTALL_TIME)
-
-    def is_package_installed(self, package_name):
-        cmd = "aptitude show {}".format(package_name).split()
-        aptitude = execute_command(cmd, timeout=QUERY_TIME)
-        return self._extract_state_from_aptitude_search_output(aptitude.get_stdout()) == "installed"
-
-    def _extract_state_from_aptitude_search_output(self, string):
-        import re
-        pattern = "^State: (?P<state>[A-Za-z0-9_-]+)$"
-        match = re.search(pattern, string, re.MULTILINE)
-        if match is None:
-            return ''
-        return match.groupdict()['state']
-
-    def remove_package(self, package_name):
-        cmd = "apt-get remove -y {}".format(package_name).split()
-        execute_command(cmd, timeout=INSTALL_TIME)
+    def get_installed_version(self, package_name):
+        raise NotImplementedError() # pragma: nocover
 
 
-class RedHatPackageManager(PackageManager):
-    def install_package(self, package_name):
-        cmd = "yum install -y {}".format(package_name).split()
-        execute_command(cmd, timeout=INSTALL_TIME)
-
+class RpmMixin(object):
     def is_package_installed(self, package_name):
         cmd = "rpm -q {}".format(package_name).split()
         info = execute_command(cmd, timeout=QUERY_TIME, check_returncode=False)
@@ -73,12 +49,64 @@ class RedHatPackageManager(PackageManager):
             return False
         raise RuntimeError("rpm -q returned unexpected results, see the log")
 
+    def get_installed_version(self, package_name):
+        cmd = "rpm -q {rpm_name} --queryformat=%{{version}}-%{{release}}".format(rpm_name=package_name).split()
+        info = execute_command(cmd, timeout=QUERY_TIME, check_returncode=False)
+        if info.get_returncode() == 0 and 'not installed' not in info.get_stdout():
+            return {'version':info.get_stdout().strip()}
+        raise RuntimeError("Couldn't get package version")
+
+
+class UbuntuPackageManager(PackageManager):
+    def install_package(self, package_name, specific_version=None):
+        cmd = "apt-get install -y {}".format(package_name)
+        if specific_version:
+            cmd += "={} --force-yes".format(specific_version)
+        execute_command(cmd.split(), timeout=INSTALL_TIME)
+
+    def is_package_installed(self, package_name):
+        cmd = "dpkg-query -l {}".format(package_name).split()
+        dpkg_query = execute_command(cmd, check_returncode=False, timeout=QUERY_TIME)
+        if dpkg_query.get_returncode() != 0:
+            return False
+        return self._extract_state_from_dpkg_query_output(dpkg_query.get_stdout()) == "ii"
+
+    def _extract_state_from_dpkg_query_output(self, string):
+        import re
+        pattern = "^(?P<state>ii)\s+"
+        match = re.search(pattern, string, re.MULTILINE)
+        if match is None:
+            return ''
+        return match.groupdict()['state']
+
+    def _extract_version_from_dpkg_query_output(self, string):
+        import re
+        pattern = "^Version:\s+(?P<version>[a-zA-Z0-9\.\-\_\:]+)$"
+        match = re.search(pattern, string, re.MULTILINE)
+        if match is None:
+            return ''
+        return match.groupdict()['version']
+
+    def remove_package(self, package_name):
+        cmd = "apt-get remove -y {}".format(package_name).split()
+        execute_command(cmd, timeout=INSTALL_TIME)
+
+    def get_installed_version(self, package_name):
+        cmd = "dpkg-query -s {}".format(package_name).split()
+        dpkg_query = execute_command(cmd, timeout=QUERY_TIME)
+        return {'version':self._extract_version_from_dpkg_query_output(dpkg_query.get_stdout())}
+
+class RedHatPackageManager(RpmMixin, PackageManager):
+    def install_package(self, package_name):
+        cmd = "yum install -y {}".format(package_name).split()
+        execute_command(cmd, timeout=INSTALL_TIME)
+
     def remove_package(self, package_name):
         cmd = "yum remove -y {}".format(package_name).split()
         execute_command(cmd, timeout=INSTALL_TIME)
 
 
-class SusePackageManager(PackageManager):
+class SusePackageManager(RpmMixin, PackageManager):
     def install_package(self, package_name):
         cmd = "zypper --non-interactive --no-gpg-checks install --auto-agree-with-licenses {}".format(package_name).split()
         execute_command(cmd, timeout=INSTALL_TIME)
@@ -87,27 +115,9 @@ class SusePackageManager(PackageManager):
         cmd = "zypper --non-interactive --no-gpg-checks update --auto-agree-with-licenses {}".format(package_name).split()
         execute_command(cmd, timeout=INSTALL_TIME)
 
-    def is_package_installed(self, package_name):
-        cmd = "rpm -q {}".format(package_name).split()
-        info = execute_command(cmd, timeout=QUERY_TIME, check_returncode=False)
-        if info.get_returncode() == 0 and 'not installed' not in info.get_stdout():
-            return True
-        if info.get_returncode() == 1 and 'package {} is not installed'.format(package_name) in info.get_stdout():
-            return False
-        raise RuntimeError("rpm -q returned unexpected results, see the log")
-
     def remove_package(self, package_name):
         cmd = "zypper --non-interactive --no-gpg-checks remove {}".format(package_name).split()
         execute_command(cmd, timeout=INSTALL_TIME)
-
-    def get_installed_version(self, package_name):
-        import re
-        cmd = "zypper --non-interactive --no-gpg-checks info {}".format(package_name).split()
-        proccess = execute_command(cmd, timeout=INSTALL_TIME)
-        match = re.search("Version:\s*(\S+)", proccess.get_stdout())
-        if match is None:
-            raise RuntimeError("Couldn't get package version")
-        return match.group(1)
 
 
 class SolarisPackageManager(PackageManager):
@@ -125,5 +135,41 @@ class SolarisPackageManager(PackageManager):
         else:
             raise RuntimeError("pkginfo returned unexpected results, see the log")
 
+    def _extract_version_from_pkginfo_output(self, string):
+        import re
+        pattern = '[\ ]*VERSION:  (?P<version>[0-9\.]+)(\,REV\=)(?P<revision>[0-9\.\_\-]+)'
+        match = re.search(pattern, string, re.MULTILINE)
+        if match is None:
+            pattern = '[\ ]*VERSION:  (?P<version>[0-9\.]+)'
+            match = re.search(pattern, string, re.MULTILINE)
+            if match is None:
+                return ''
+        return match.groupdict()
+
+    def get_installed_version(self, package_name):
+        """return dict of version and revision ( if exsist ) per pkg"""
+        cmd = "pkginfo -l {}".format(package_name).split()
+        pkginfo = execute_command(cmd, timeout=QUERY_TIME)
+        return self._extract_version_from_pkginfo_output(pkginfo.get_stdout())
+
     def remove_package(self, package_name):
         raise NotImplementedError
+
+
+def get_package_manager():
+    from infi.os_info import get_platform_string
+    platform_name = get_platform_string().split("-")[0]
+    if platform_name == 'linux':
+        # get distribution
+        platform_name = get_platform_string().split("-")[1]
+    pkgmgr_dict = {
+        'ubuntu': UbuntuPackageManager,
+        'redhat': RedHatPackageManager,
+        'centos': RedHatPackageManager,
+        'suse': SusePackageManager,
+        'solaris': SolarisPackageManager
+    }
+    if platform_name in pkgmgr_dict:
+        return pkgmgr_dict.get(platform_name)()
+    else:
+        raise RuntimeError("Package Manager is not implemented for {}".format(platform_name))
